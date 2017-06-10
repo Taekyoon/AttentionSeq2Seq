@@ -57,23 +57,28 @@ class AttentionSeq2Seq(object):
 
     @staticmethod
     def attention(encoder_hidden_states,
-                  last_hidden_state):
+                  last_hidden_state,
+                  reuse=False):
 
         encoder_seq_len = encoder_hidden_states.get_shape().as_list()[1]
         encoder_hidden_state_dim = encoder_hidden_states.get_shape().as_list()[2]
         last_hidden_state_dim = last_hidden_state.get_shape().as_list()[1]
 
-        with tf.variable_scope('attention') as scope:
+        with tf.variable_scope('attention', reuse=reuse) as scope:
             _encoder_hidden_states = tf.reshape(encoder_hidden_states, shape=[-1, encoder_hidden_state_dim])
-            W_a = tf.Variable(tf.random_normal([last_hidden_state_dim,
-                                                 last_hidden_state_dim],
-                                                stddev=1.0), name='W_a')
-            U_a = tf.Variable(tf.random_normal([encoder_hidden_state_dim,
-                                                 last_hidden_state_dim],
-                                                stddev=1.0), name='U_a')
-            v_a = tf.Variable(tf.random_normal([last_hidden_state_dim, 1],
-                                                stddev=1.0), name='v_a')
-            b = tf.Variable(tf.zeros(shape=[last_hidden_state_dim]), name='b')
+            W_a = tf.get_variable('W_a', [last_hidden_state_dim, last_hidden_state_dim],
+                                  initializer=tf.random_uniform_initializer())
+            print(W_a.op.name)
+            U_a = tf.get_variable('U_a', [encoder_hidden_state_dim, last_hidden_state_dim],
+                                  initializer=tf.random_uniform_initializer())
+            print(U_a.op.name)
+            v_a = tf.get_variable('v_a', [last_hidden_state_dim, 1],
+                                  initializer=tf.random_uniform_initializer())
+            print(v_a.op.name)
+            b = tf.get_variable('b', [last_hidden_state_dim],
+                                initializer=tf.zeros_initializer())
+            print(b.op.name)
+
 
             product_hidden_states = tf.reshape(tf.matmul(_encoder_hidden_states, U_a),
                                                  shape=[-1, encoder_seq_len, last_hidden_state_dim])
@@ -97,73 +102,106 @@ class AttentionSeq2Seq(object):
             embeddings = tf.get_variable('embeddings',
                                          [self.decoder_symbol_size, self.embedding_size],
                                          initializer=tf.random_uniform_initializer())
-            dec_batch_embeddings = tf.nn.embedding_lookup(embeddings, self.dec_batch_inputs)
+            print(embeddings.op.name)
 
-            self.cells = [tf.contrib.rnn.GRUCell(num_units=self.hidden_size) for _ in range(self.decoder_sequence_size)]
-            initial_state = self.encoder_hidden_state
-            outputs_list = []
+        dec_batch_embeddings = tf.nn.embedding_lookup(embeddings, self.dec_batch_inputs)
 
-            self.decoder_time_step_scope = []
-            for t in range(self.decoder_sequence_size):
-                with tf.variable_scope('decoder_' + str(t) + '_step') as t_scope:
-                    self.decoder_time_step_scope.append(t_scope)
-                    context = self.attention(self.context_vectors, initial_state)
-                    concat_batch_inputs = tf.expand_dims(tf.concat([dec_batch_embeddings[:, t], context], 1),
-                                                         dim=1)
-                    cell = self.cells[t]
-                    output, state = tf.nn.dynamic_rnn(cell,
-                                                      concat_batch_inputs,
-                                                      initial_state=initial_state,
-                                                      dtype=tf.float32)
-                    inputs_for_fc = tf.reshape(output, [-1, self.hidden_size])
-                    fc_outputs = tf.contrib.layers.fully_connected(inputs=inputs_for_fc,
-                                                                   num_outputs=self.decoder_symbol_size)
-                    outputs_list.append(tf.reshape(fc_outputs, [-1, self.decoder_symbol_size]))
-                    initial_state = state
+        self.cells = [tf.contrib.rnn.GRUCell(num_units=self.hidden_size) for _ in range(self.decoder_sequence_size)]
+        #self.cells = SharedGRUCell(num_units=self.hidden_size)
+        initial_state = self.encoder_hidden_state
+        outputs_list = []
+        reuse = False
 
-            logits = tf.stack(outputs_list, axis=1)
-            weights = tf.ones([self.batch_size, self.decoder_sequence_size])
-            sequence_loss = tf.contrib.seq2seq.sequence_loss(logits=logits,
-                                                             targets=self.batch_labels,
-                                                             weights=weights)
-            self.loss = tf.reduce_mean(sequence_loss)
+        self.decoder_time_step_scope = []
+        for t in range(self.decoder_sequence_size):
+            if t != 0:
+                reuse = True
+
+            context = self.attention(self.context_vectors, initial_state, reuse=reuse)
+            with tf.variable_scope('decoder_' + str(t) + '_step') as t_scope:
+                self.decoder_time_step_scope.append(t_scope)
+                concat_batch_inputs = tf.expand_dims(tf.concat([dec_batch_embeddings[:, t], context], 1),
+                                                     dim=1)
+                cell = self.cells[t]
+                output, state = tf.nn.dynamic_rnn(cell,
+                                                  concat_batch_inputs,
+                                                  initial_state=initial_state,
+                                                  dtype=tf.float32)
+                print(output.op.name)
+                print(state.op.name)
+
+                inputs_for_fc = tf.reshape(output, [-1, self.hidden_size])
+
+            with tf.variable_scope(self.decoder_scope, reuse=reuse):
+                fully_connected_weight = tf.get_variable('fully_connected_weight',
+                                                         [self.hidden_size, self.decoder_symbol_size],
+                                                         initializer=tf.random_uniform_initializer())
+                fully_connected_bias = tf.get_variable('fully_connected_bias',
+                                                       [self.decoder_symbol_size],
+                                                       initializer=tf.zeros_initializer())
+
+                fc_outputs = tf.matmul(inputs_for_fc, fully_connected_weight) + fully_connected_bias
+
+            print(fully_connected_weight.op.name)
+
+            outputs_list.append(tf.reshape(fc_outputs, [-1, self.decoder_symbol_size]))
+            initial_state = state
+
+        logits = tf.stack(outputs_list, axis=1)
+        weights = tf.ones([self.batch_size, self.decoder_sequence_size])
+        sequence_loss = tf.contrib.seq2seq.sequence_loss(logits=logits,
+                                                         targets=self.batch_labels,
+                                                         weights=weights)
+        self.loss = tf.reduce_mean(sequence_loss)
 
     def decoder_pred(self):
         self.current_word = tf.placeholder(tf.int32, shape=[self.batch_size, 1])
 
         with tf.variable_scope(self.decoder_scope, reuse=True):
             embeddings = tf.get_variable('embeddings')
-            initial_state = self.encoder_hidden_state
-            outputs_list = []
+            print(embeddings.op.name)
 
-            for t in range(self.decoder_sequence_size):
-                dec_batch_embeddings = tf.nn.embedding_lookup(embeddings, self.current_word)
+        initial_state = self.encoder_hidden_state
+        outputs_list = []
 
-                with tf.variable_scope(self.decoder_time_step_scope[t], reuse=True):
-                    context = self.attention(self.context_vectors, initial_state)
-                    concat_batch_inputs = tf.expand_dims(tf.concat([dec_batch_embeddings[:, 0], context], 1),
-                                                         dim=1)
-                    cell = self.cells[t]
-                    output, state = tf.nn.dynamic_rnn(cell,
-                                                      concat_batch_inputs,
-                                                      initial_state=initial_state,
-                                                      dtype=tf.float32)
-                    inputs_for_fc = tf.reshape(output, [-1, self.hidden_size])
-                    fc_outputs = tf.contrib.layers.fully_connected(inputs=inputs_for_fc,
-                                                                   num_outputs=self.decoder_symbol_size)
-                    logits = tf.reshape(fc_outputs, [self.batch_size, 1, self.decoder_symbol_size])
-                    current_word = tf.argmax(logits, axis=2)
-                    outputs_list.append(current_word)
-                    initial_state = state
+        for t in range(self.decoder_sequence_size):
+            dec_batch_embeddings = tf.nn.embedding_lookup(embeddings, self.current_word)
+            context = self.attention(self.context_vectors, initial_state, reuse=True)
+            with tf.variable_scope(self.decoder_time_step_scope[t], reuse=True) as pred_t_scope:
+                concat_batch_inputs = tf.expand_dims(tf.concat([dec_batch_embeddings[:, 0], context], 1),
+                                                     dim=1)
+                cell = self.cells[t]
+                output, state = tf.nn.dynamic_rnn(cell,
+                                                  concat_batch_inputs,
+                                                  initial_state=initial_state,
+                                                  dtype=tf.float32)
+                print(output.op.name)
+                print(state.op.name)
 
-            self.pred = tf.stack(outputs_list, axis=1)
+                inputs_for_fc = tf.reshape(output, [-1, self.hidden_size])
+
+            with tf.variable_scope(self.decoder_scope, reuse=True):
+                fully_connected_weight = tf.get_variable('fully_connected_weight')
+                fully_connected_bias = tf.get_variable('fully_connected_bias')
+
+                fc_outputs = tf.matmul(inputs_for_fc, fully_connected_weight) + fully_connected_bias
+
+            print(fully_connected_weight.op.name)
+            logits = tf.reshape(fc_outputs, [self.batch_size, 1, self.decoder_symbol_size])
+            current_word = tf.argmax(logits, axis=2)
+            outputs_list.append(current_word)
+            initial_state = state
+
+        self.pred = tf.stack(outputs_list, axis=1)
+
+    def decoder_rnn_with_attention(self):
+        pass
 
     def _build_train_net(self):
         self.encoder()
         self.decoder_train()
         self.decoder_pred()
         self.optimizer = tf.train.AdamOptimizer(learning_rate=0.1).minimize(self.loss)
-
 
     def train(self, encoder_data, decoder_data, label_data):
         return self.sess.run([self.loss, self.optimizer], feed_dict={self.enc_batch_inputs: encoder_data,
@@ -173,3 +211,15 @@ class AttentionSeq2Seq(object):
     def prediction(self, encoder_data, starting_data):
         return self.sess.run(self.pred, feed_dict={self.enc_batch_inputs: encoder_data,
                                                    self.current_word: starting_data})
+
+class SharedGRUCell(tf.contrib.rnn.GRUCell):
+    def __init__(self, num_units, input_size=None, activation=tf.nn.tanh):
+        tf.contrib.rnn.GRUCell.__init__(self, num_units, input_size, activation)
+        self.my_scope = None
+
+    def __call__(self, a, b):
+        if self.my_scope == None:
+            self.my_scope = tf.get_variable_scope()
+        else:
+            self.my_scope.reuse_variables()
+        return tf.contrib.rnn.GRUCell.__call__(self, a, b, self.my_scope)
